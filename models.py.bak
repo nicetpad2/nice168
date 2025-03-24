@@ -1,0 +1,316 @@
+# -*- coding: utf-8 -*-
+import numpy as np
+import pandas as pd
+from stable_baselines3 import PPO
+from stable_baselines3.common.vec_env import DummyVecEnv
+from stable_baselines3.common.env_checker import check_env
+import gymnasium as gym
+from gymnasium import spaces
+import talib
+import matplotlib.pyplot as plt
+
+class GoldTradingEnvV9(gym.Env):
+    metadata = {'render_modes': ['human'], "render_fps": 30}
+
+    def __init__(self, df_path='xauusd_m5.csv', mode='train', train_stats=None):
+        super().__init__()
+        
+        # โหลดและเตรียมข้อมูล
+        self.df = pd.read_csv(df_path, sep='\t')
+        self._prepare_data()
+        
+        # แบ่งข้อมูลและคำนวณสถิติการ normalize
+        self.lookback = 200  # ค่าสูงสุดของ indicator lookback
+        split_idx = int(len(self.df) * 0.85)
+        
+        if mode == 'train':
+            self.data = self.df.iloc[:split_idx]
+            self._process_data()
+            self.train_mean = self.data.mean()
+            self.train_std = self.data.std()
+        else:
+            # รวมข้อมูล lookback จาก training set
+            test_start = split_idx - self.lookback
+            self.data = self.df.iloc[test_start:]
+            self._process_data()
+            # ตัดส่วน lookback ออก
+            self.data = self.data.iloc[self.lookback:]
+            # ใช้สถิติจาก training data
+            self.train_mean = train_stats['mean']
+            self.train_std = train_stats['std']
+        
+        # กำหนด action และ observation space
+        self.action_space = spaces.Discrete(3)  # 0: Hold, 1: Long, 2: Short
+        self.observation_space = spaces.Box(
+            low=-np.inf, 
+            high=np.inf, 
+            shape=(22,),
+            dtype=np.float32
+        )
+        
+        # ค่าคงที่
+        self.initial_balance = 100.0  # ทุน $100
+        self.commission = 0.0005  # Commission ต่อ Lot
+        self.max_risk_per_trade = 0.02  # Risk สูงสุด 2% ต่อการเทรด
+        self.lot_size = 0.01  # Lot ขนาด 0.01 (1 Micro Lot)
+        
+        # สถานะปัจจุบัน
+        self.current_step = 0
+        self.position = None
+        self.balance = self.initial_balance
+        self.equity = [self.initial_balance]
+        self.trade_history = []
+
+    def _prepare_data(self):
+        # แปลงข้อมูลพื้นฐาน
+        numeric_cols = ['<OPEN>', '<HIGH>', '<LOW>', '<CLOSE>', '<TICKVOL>']
+        self.df[numeric_cols] = self.df[numeric_cols].apply(pd.to_numeric, errors='coerce')
+        self.df['time'] = pd.to_datetime(self.df['<DATE>'] + ' ' + self.df['<TIME>'])
+        self.df.sort_values('time', inplace=True)
+        self.df.drop(columns=['<DATE>', '<TIME>'], inplace=True)
+
+    def _process_data(self):
+        # คำนวณ indicators
+        closes = self.df['<CLOSE>'].values.astype(np.float64)
+        highs = self.df['<HIGH>'].values.astype(np.float64)
+        lows = self.df['<LOW>'].values.astype(np.float64)
+        volumes = self.df['<TICKVOL>'].values.astype(np.float64)
+        
+        # คำนวณ features
+        self.df['RSI'] = talib.RSI(closes, 14)
+        self.df['MACD'], self.df['MACD_signal'], _ = talib.MACD(closes, 12, 26, 9)
+        self.df['ATR'] = talib.ATR(highs, lows, closes, 14)
+        self.df['ADX'] = talib.ADX(highs, lows, closes, 14)
+        self.df['OBV'] = talib.OBV(closes, volumes)
+        self.df['MA50'] = talib.SMA(closes, 50)
+        self.df['MA200'] = talib.SMA(closes, 200)
+        self.df['Trend'] = np.where(self.df['MA50'] > self.df['MA200'], 1.0, -1.0)
+        self.df['Volatility'] = self.df['ATR'] / closes
+        
+        # เพิ่ม feature เวลา
+        self.df['Hour'] = self.df.index.hour / 24.0
+        self.df['DayOfWeek'] = self.df.index.dayofweek / 7.0
+        
+        self.df.dropna(inplace=True)
+
+    def _get_state(self):
+        row = self.data.iloc[self.current_step]
+        
+        # Normalize ด้วยสถิติจาก training data
+        close_norm = (row['<CLOSE>'] - self.train_mean['<CLOSE>']) / (self.train_std['<CLOSE>'] + 1e-9)
+        rsi_norm = (row['RSI'] - 50) / 30  # ปรับให้อยู่ในช่วงประมาณ -1 ถึง 1
+        macd_norm = row['MACD'] / 100.0
+        
+        # สถานะปัจจุบัน
+        state = [
+            close_norm,
+            rsi_norm,
+            macd_norm,
+            row['ATR'] / self.train_mean['ATR'],
+            row['ADX'] / 100.0,
+            row['OBV'] / 1e6,
+            row['MA50'] / row['MA200'] - 1.0,
+            row['Trend'],
+            row['Volatility'] * 100,
+            row['Hour'],
+            row['DayOfWeek'],
+            self.position['size'] / 100.0 if self.position else 0.0,
+            (self.position['entry_price'] / row['<CLOSE>'] - 1.0) * 100 if self.position else 0.0,
+            self.balance / self.initial_balance,
+            self.current_step / len(self.data),
+            (row['<HIGH>'] - row['<LOW>']) / row['<CLOSE>'],
+            (row['<CLOSE>'] - row['<OPEN>']) / row['<OPEN>'],
+            (self.data['<CLOSE>'].iloc[self.current_step] / self.data['<CLOSE>'].iloc[max(0, self.current_step-50)] - 1.0) * 100,
+            len(self.trade_history) / (self.current_step + 1),
+            np.mean([t['profit'] for t in self.trade_history[-5:]])/self.initial_balance if self.trade_history else 0.0,
+            np.std(self.equity[-10:])/self.initial_balance if len(self.equity) >=10 else 0.0,
+            (self.current_step - self.position['entry_step'])/100.0 if self.position else 0.0
+        ]
+        return np.array(state, dtype=np.float32)
+
+    def _calculate_position_size(self, risk_pct):
+        current_price = self.data.iloc[self.current_step]['<CLOSE>']
+        atr = self.data.iloc[self.current_step]['ATR']
+        balance_risk = self.balance * risk_pct
+        
+        # Kelly Criterion แบบไดนามิก
+        win_rate = 0.55  # ค่าจาก backtest
+        avg_win = 1.5 * atr
+        avg_loss = 1.0 * atr
+        kelly_f = (win_rate * (avg_win/avg_loss + 1) - 1) / (avg_win/avg_loss)
+        
+        risk_amount = self.balance * min(kelly_f, 0.02)  # จำกัดความเสี่ยงสูงสุด 2%
+        size = min(risk_amount / (3.0 * atr), self.lot_size)  # จำกัดขนาด Lot ที่ 0.01
+        return round(size, 2)
+
+    def _execute_trade(self, action):
+        current_price = self.data.iloc[self.current_step]['<CLOSE>']
+        spread = 0.00009  # 0.09 สำหรับ 3 Digits
+        
+        if action == 0 or self.position is not None:
+            return  # ไม่ทำการเทรด
+        
+        risk_pct = 0.01  # 1% ของทุน
+        tp_multiplier = 2.0  # Risk-Reward Ratio 1:2
+        
+        size = self._calculate_position_size(risk_pct)
+        if size <= 0:
+            return
+        
+        atr = self.data.iloc[self.current_step]['ATR']
+        direction = 'long' if action == 1 else 'short'
+        
+        self.position = {
+            'type': direction,
+            'entry_price': current_price + (spread if direction == 'long' else -spread),
+            'size': size,
+            'sl': current_price - (3 * atr if direction == 'long' else -3 * atr),
+            'tp': current_price + (tp_multiplier * atr if direction == 'long' else -tp_multiplier * atr),
+            'entry_step': self.current_step
+        }
+        
+        # คำนวณ Commission
+        commission = size * current_price * self.commission
+        self.balance -= commission
+        self.equity[-1] = self.balance
+
+    def _update_position(self):
+        if self.position:
+            current_price = self.data.iloc[self.current_step]['<CLOSE>']
+            spread = 0.00009
+            
+            # ตรวจสอบเงื่อนไขด้วยราคาปัจจุบัน (ก่อน spread)
+            if self.position['type'] == 'long':
+                exit_condition = current_price >= self.position['tp'] or current_price <= self.position['sl']
+                exit_price = current_price - spread
+            else:
+                exit_condition = current_price <= self.position['tp'] or current_price >= self.position['sl']
+                exit_price = current_price + spread
+            
+            if exit_condition:
+                pnl = (exit_price - self.position['entry_price']) * self.position['size'] * (1 if self.position['type'] == 'long' else -1)
+                self.balance += pnl
+                self.equity.append(self.balance)
+                
+                self.trade_history.append({
+                    **self.position,
+                    'exit_price': exit_price,
+                    'profit': pnl,
+                    'duration': self.current_step - self.position['entry_step']
+                })
+                self.position = None
+            else:
+                # อัพเดท equity ตามกำไรขาดทุนล่าสุด
+                unrealized_pnl = (current_price - self.position['entry_price']) * self.position['size'] * (1 if self.position['type'] == 'long' else -1)
+                self.equity.append(self.balance + unrealized_pnl)
+
+    def step(self, action):
+        prev_balance = self.balance
+        self._execute_trade(action)
+        self._update_position()
+        
+        terminated = self.current_step >= len(self.data) - 1
+        truncated = False
+        
+        # คำนวณ Reward
+        reward = 0.0
+        if len(self.equity) >= 2:
+            returns = np.diff(self.equity[-50:]) / self.equity[:-1]
+            if len(returns) > 0:
+                sharpe = np.mean(returns) / (np.std(returns) + 1e-9) * np.sqrt(252*288)
+                reward += sharpe * 0.2
+        
+        reward += (self.balance - prev_balance) / prev_balance * 100 if prev_balance != 0 else 0
+        
+        # เพิ่ม Penalty สำหรับ Drawdown สูง
+        max_equity = max(self.equity)
+        drawdown = (max_equity - self.equity[-1]) / max_equity
+        reward -= drawdown * 50
+        
+        # จำกัดการเทรดต่อวัน
+        trades_today = len([t for t in self.trade_history 
+                          if t['entry_step'] >= self.current_step - 288])
+        if trades_today > 5:
+            reward -= 1.0
+        
+        self.current_step += 1
+        
+        # ตรวจสอบเงื่อนไขจบรอบ
+        if self.balance < self.initial_balance * 0.5:
+            truncated = True
+        
+        return self._get_state(), reward, terminated, truncated, {}
+
+    def reset(self, seed=None, options=None):
+        super().reset(seed=seed, options=options)
+        self.current_step = 0
+        self.position = None
+        self.balance = self.initial_balance
+        self.equity = [self.initial_balance]
+        self.trade_history = []
+        return self._get_state(), {}
+
+    def render(self, mode='human'):
+        plt.figure(figsize=(18,12))
+        
+        # แสดงกราฟ equity
+        plt.subplot(3,1,1)
+        plt.plot(self.equity)
+        plt.title(f'Equity Curve (Current Balance: ${self.balance:.2f})')
+        
+        # แสดงกราฟราคาและจุดเทรด
+        plt.subplot(3,1,2)
+        closes = self.data['<CLOSE>'].iloc[:self.current_step]
+        plt.plot(closes, label='Price')
+        if self.trade_history:
+            for trade in self.trade_history:
+                color = 'green' if trade['profit'] > 0 else 'red'
+                marker = '^' if trade['type'] == 'long' else 'v'
+                plt.scatter(trade['entry_step'], trade['entry_price'], 
+                           color=color, marker=marker, alpha=0.7)
+        plt.legend()
+        
+        # แสดงสถิติการเทรด
+        plt.subplot(3,1,3)
+        if self.trade_history:
+            profits = [t['profit'] for t in self.trade_history]
+            plt.hist(profits, bins=20, color='skyblue', edgecolor='black')
+            plt.title(f'Profit Distribution (Win Rate: {len([p for p in profits if p>0])/len(profits):.1%})')
+        
+        plt.tight_layout()
+        plt.show()
+
+if __name__ == "__main__":
+    # ฝึกโมเดล
+    train_env = DummyVecEnv([lambda: GoldTradingEnvV9(mode='train')])
+    check_env(train_env.unwrapped)
+    
+    # สร้างและฝึกโมเดล
+    model = PPO(
+        "MlpPolicy",
+        train_env,
+        verbose=1,
+        learning_rate=3e-5,
+        n_steps=2048,
+        batch_size=128,
+        n_epochs=10,
+        gamma=0.99,
+        ent_coef=0.05,
+        clip_range=0.2,
+        policy_kwargs=dict(net_arch=[256,256])
+    )
+    model.learn(total_timesteps=1_000_000)
+    model.save("gold_trading_v9")
+    
+    # ทดสอบโมเดล
+    train_stats = {'mean': train_env.envs[0].train_mean, 'std': train_env.envs[0].train_std}
+    test_env = DummyVecEnv([lambda: GoldTradingEnvV9(mode='test', train_stats=train_stats)])
+    model = PPO.load("gold_trading_v9")
+    
+    obs, _ = test_env.reset()
+    while True:
+        action, _ = model.predict(obs)
+        obs, _, terminated, truncated, _ = test_env.step(action)
+        if terminated or truncated:
+            test_env.envs[0].render()
+            break
